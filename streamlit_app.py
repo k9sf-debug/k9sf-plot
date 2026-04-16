@@ -402,9 +402,6 @@ with st.sidebar:
 
 if df.empty:
     st.info("Admin: upload the Excel roster in admin mode. Viewers: wait for admin to load roster.")
-    if mode == "viewer":
-        time.sleep(2)
-        st.rerun()
     st.stop()
 
 runs = sorted(df["Run Number"].astype(int).tolist())
@@ -595,6 +592,4 @@ if mode == "admin":
 else:
     st.caption("Viewer mode is read-only. Ask the admin if something needs to change.")
 
-if mode == "viewer":
-    time.sleep(2)
-    st.rerun()
+
