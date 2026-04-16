@@ -41,18 +41,21 @@ def release_lock() -> None:
 
 def load_app_ro_excel(uploaded_file) -> pd.DataFrame:
     raw = pd.read_excel(uploaded_file, header=None)
+
     header_idx = None
     for i in range(min(len(raw), 120)):
-        row = raw.iloc[i].astype(str).str.strip().tolist()
-        if any(cell.lower() == "run number" for cell in row):
+        row = [str(cell).strip().lower() for cell in raw.iloc[i].tolist()]
+        if "run number" in row:
             header_idx = i
             break
+
     if header_idx is None:
         raise ValueError("Couldn't find a header row containing 'Run Number'.")
 
-    cols = list(raw.iloc[header_idx].values)
+    cols = [str(c).strip() for c in raw.iloc[header_idx].tolist()]
     df = raw.iloc[header_idx + 1 :].copy()
     df.columns = cols
+
     if "Run Number" not in df.columns:
         raise ValueError("Parsed header but 'Run Number' column missing.")
 
@@ -60,10 +63,12 @@ def load_app_ro_excel(uploaded_file) -> pd.DataFrame:
     df["Run Number"] = pd.to_numeric(df["Run Number"], errors="coerce")
     df = df.dropna(subset=["Run Number"]).copy()
     df["Run Number"] = df["Run Number"].astype(int)
+
     if "Status" not in df.columns:
         df["Status"] = "Active"
     else:
         df["Status"] = df["Status"].fillna("Active").astype(str)
+
     return df.sort_values("Run Number").reset_index(drop=True)
 
 
