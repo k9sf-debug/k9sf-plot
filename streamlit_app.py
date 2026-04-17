@@ -1,600 +1,686 @@
 
-import json
-import os
 import time
-from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-
 import pandas as pd
-import qrcode
 import streamlit as st
-from PIL import Image
 
-APP_TITLE = "Running Order — Two Simultaneous Searches"
-DEFAULT_ADMIN_PIN = os.environ.get("RUNORDER_ADMIN_PIN", "2468")
-STATE_FILE = Path(os.environ.get("RUNORDER_STATE_FILE", "shared_state.json"))
-LOCK_FILE = Path(str(STATE_FILE) + ".lock")
+st.set_page_config(page_title="K9SF Running Order", layout="wide")
 
-SEARCH1_COLOR = "#1f77b4"
-SEARCH2_COLOR = "#d62728"
-
-
-def acquire_lock(timeout_s: float = 5.0) -> bool:
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        try:
-            fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
-            return True
-        except FileExistsError:
-            time.sleep(0.05)
-    return False
+DEFAULT_COLORS = {
+    "LEFT": "#1E3A8A",   # blue
+    "RIGHT": "#B91C1C",  # red
+}
+DEFAULT_TEXT_COLOR = "#FFFFFF"
 
 
-def release_lock() -> None:
-    try:
-        LOCK_FILE.unlink(missing_ok=True)
-    except Exception:
-        pass
+def init_ro_state():
+    defaults = {
+        "left_index": 0,
+        "right_index": 0,
+        "left_hold": False,
+        "right_hold": False,
+        "left_color": DEFAULT_COLORS["LEFT"],
+        "right_color": DEFAULT_COLORS["RIGHT"],
+        "text_color": DEFAULT_TEXT_COLOR,
+        "left_flash": False,
+        "right_flash": False,
+        "left_status_text": "HOLD",
+        "right_status_text": "HOLD",
+        "left_search_name": "Search 1",
+        "right_search_name": "Search 2",
+        "left_search_description": "",
+        "right_search_description": "",
+        "left_df": None,
+        "right_df": None,
+        "source_filename": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 
-def load_app_ro_excel(uploaded_file) -> pd.DataFrame:
-    raw = pd.read_excel(uploaded_file, header=None)
+init_ro_state()
 
-    header_idx = None
-    for i in range(min(len(raw), 120)):
-        row = [str(cell).strip().lower() for cell in raw.iloc[i].tolist()]
-        if "run number" in row:
-            header_idx = i
+
+# ----------------------------
+# HELPERS
+# ----------------------------
+def safe_str(val):
+    if pd.isna(val):
+        return ""
+    return str(val).strip()
+
+
+def ensure_required_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    required_defaults = {
+        "RO": "",
+        "Handler": "",
+        "Dog": "",
+        "Breed": "",
+        "Status": "ACTIVE",
+    }
+    for col, default in required_defaults.items():
+        if col not in df.columns:
+            df[col] = default
+
+    df["RO"] = df["RO"].fillna("").astype(str).str.strip()
+    df["Handler"] = df["Handler"].fillna("").astype(str).str.strip()
+    df["Dog"] = df["Dog"].fillna("").astype(str).str.strip()
+    df["Breed"] = df["Breed"].fillna("").astype(str).str.strip()
+    df["Status"] = df["Status"].fillna("ACTIVE").astype(str).str.upper().str.strip()
+    df.loc[df["Status"] == "", "Status"] = "ACTIVE"
+    return df
+
+
+def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename common spreadsheet headers to the fields the app uses."""
+    df = df.copy()
+    rename_map = {}
+    for col in df.columns:
+        key = safe_str(col).lower()
+        if key in {"ro", "running order", "order", "#"}:
+            rename_map[col] = "RO"
+        elif key in {"handler", "handler name", "name", "team"}:
+            rename_map[col] = "Handler"
+        elif key in {"dog", "dog name"}:
+            rename_map[col] = "Dog"
+        elif key in {"breed", "dog breed"}:
+            rename_map[col] = "Breed"
+        elif key in {"status"}:
+            rename_map[col] = "Status"
+    return df.rename(columns=rename_map)
+
+
+def split_uploaded_dataframe(df: pd.DataFrame):
+    """
+    Splits uploaded running order into two panels.
+    Preferred formats:
+    1) Columns named Side/Search/Panel/Lane with values left/right or 1/2.
+    2) Columns already filtered externally and user uploads a file with both halves identified.
+    Fallback: split the file in half.
+    """
+    df = standardize_columns(df)
+    original = df.copy()
+
+    side_col = None
+    for c in original.columns:
+        key = safe_str(c).lower()
+        if key in {"side", "search", "panel", "lane", "group"}:
+            side_col = c
             break
 
-    if header_idx is None:
-        raise ValueError("Couldn't find a header row containing 'Run Number'.")
+    if side_col:
+        side_vals = original[side_col].fillna("").astype(str).str.strip().str.lower()
+        left_mask = side_vals.isin(["left", "l", "1", "search 1", "side 1", "lane 1", "panel 1", "a"])
+        right_mask = side_vals.isin(["right", "r", "2", "search 2", "side 2", "lane 2", "panel 2", "b"])
 
-    cols = [str(c).strip() for c in raw.iloc[header_idx].tolist()]
-    df = raw.iloc[header_idx + 1 :].copy()
-    df.columns = cols
+        left_df = original[left_mask].drop(columns=[side_col], errors="ignore").reset_index(drop=True)
+        right_df = original[right_mask].drop(columns=[side_col], errors="ignore").reset_index(drop=True)
 
-    if "Run Number" not in df.columns:
-        raise ValueError("Parsed header but 'Run Number' column missing.")
+        if not left_df.empty or not right_df.empty:
+            return ensure_required_columns(left_df), ensure_required_columns(right_df)
 
-    df = df.dropna(subset=["Run Number"]).copy()
-    df["Run Number"] = pd.to_numeric(df["Run Number"], errors="coerce")
-    df = df.dropna(subset=["Run Number"]).copy()
-    df["Run Number"] = df["Run Number"].astype(int)
-
-    if "Status" not in df.columns:
-        df["Status"] = "Active"
-    else:
-        df["Status"] = df["Status"].fillna("Active").astype(str)
-
-    return df.sort_values("Run Number").reset_index(drop=True)
+    # fallback: split in half
+    midpoint = (len(original) + 1) // 2
+    left_df = original.iloc[:midpoint].reset_index(drop=True)
+    right_df = original.iloc[midpoint:].reset_index(drop=True)
+    return ensure_required_columns(left_df), ensure_required_columns(right_df)
 
 
-def team_string(row: pd.Series) -> str:
-    rn = int(row["Run Number"])
-    last_ = str(row.get("Handler Last Name", "")).strip()
-    first_ = str(row.get("Handler First Name", "")).strip()
-    dog_ = str(row.get("Dog Call Name", "")).strip()
-    breed_ = str(row.get("Breed", "")).strip()
-    base = f"{rn}: {first_} {last_} — {dog_}".strip()
-    if breed_ and breed_ != "nan":
-        base += f" ({breed_})"
-    return base
+def is_active_row(row) -> bool:
+    if row is None:
+        return False
+    status = safe_str(row.get("Status", "ACTIVE")).upper()
+    return status != "SCRATCH"
 
 
-def clamp_to_existing(runs_sorted: List[int], desired: int) -> int:
-    if not runs_sorted:
-        return desired
-    if desired <= runs_sorted[0]:
-        return runs_sorted[0]
-    if desired > runs_sorted[-1]:
-        return runs_sorted[0]
-    for r in runs_sorted:
-        if r >= desired:
-            return r
-    return runs_sorted[0]
+def get_next_active_index(df: pd.DataFrame, start_idx: int) -> int:
+    if df is None or df.empty:
+        return 0
+    idx = max(0, start_idx)
+    while idx < len(df):
+        if is_active_row(df.iloc[idx]):
+            return idx
+        idx += 1
+    return len(df) - 1
 
 
-def next_run_wrap(runs_sorted: List[int], current: int) -> int:
-    if not runs_sorted:
-        return current
-    try:
-        idx = runs_sorted.index(current)
-    except ValueError:
-        return clamp_to_existing(runs_sorted, current)
-    return runs_sorted[(idx + 1) % len(runs_sorted)]
+def get_prev_active_index(df: pd.DataFrame, start_idx: int) -> int:
+    if df is None or df.empty:
+        return 0
+    idx = min(start_idx, len(df) - 1)
+    while idx >= 0:
+        if is_active_row(df.iloc[idx]):
+            return idx
+        idx -= 1
+    return 0
 
 
-@dataclass
-class SharedState:
-    started: bool = False
-    s1_now: Optional[int] = None
-    s2_now: Optional[int] = None
-    s1_start: int = 1
-    s2_start: int = 15
-    scratched: List[int] = None
-    roster_rows: List[Dict[str, Any]] = None
-    log: List[Dict[str, Any]] = None
-    updated_at: float = 0.0
-    s1_start_time: str = ""
-    s2_start_time: str = ""
-    breaks_info: str = ""
-    end_of_search_info: str = ""
-    message_board: str = ""
-
-    def __post_init__(self):
-        if self.scratched is None:
-            self.scratched = []
-        if self.roster_rows is None:
-            self.roster_rows = []
-        if self.log is None:
-            self.log = []
+def first_active_index(df: pd.DataFrame) -> int:
+    return get_next_active_index(df, 0)
 
 
-def read_state() -> SharedState:
-    if not STATE_FILE.exists():
-        return SharedState()
-    try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        return SharedState(**data)
-    except Exception:
-        return SharedState()
-
-
-def write_state(state: SharedState) -> None:
-    state.updated_at = time.time()
-    if not acquire_lock():
-        st.warning("Busy (someone else is updating). Try again.")
-        return
-    try:
-        STATE_FILE.write_text(json.dumps(asdict(state), indent=2), encoding="utf-8")
-    finally:
-        release_lock()
-
-
-def add_log(state: SharedState, action: str, search: str, run_number: Optional[int], note: str = ""):
-    state.log.append(
-        {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "action": action,
-            "search": search,
-            "run_number": run_number,
-            "note": note,
-        }
-    )
-
-
-def get_df_from_state(state: SharedState) -> pd.DataFrame:
-    if not state.roster_rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(state.roster_rows)
-    if "Status" not in df.columns:
-        df["Status"] = "Active"
-    df["Status"] = df["Status"].fillna("Active").astype(str)
-    if "Run Number" in df.columns:
-        df["Run Number"] = pd.to_numeric(df["Run Number"], errors="coerce")
-        df = df.dropna(subset=["Run Number"]).copy()
-        df["Run Number"] = df["Run Number"].astype(int)
-    return df.sort_values("Run Number").reset_index(drop=True)
-
-
-def get_row(df: pd.DataFrame, run_number: int) -> Optional[pd.Series]:
-    m = df[df["Run Number"] == run_number]
-    if m.empty:
+def get_display_row(df: pd.DataFrame, idx: int):
+    if df is None or df.empty:
         return None
-    return m.iloc[0]
-
-
-def build_inactive_set(df: pd.DataFrame, scratched: List[int]) -> set:
-    inactive = set(int(x) for x in (scratched or []))
-    if not df.empty and "Status" in df.columns:
-        cancelled = df.loc[df["Status"].fillna("Active") != "Active", "Run Number"].astype(int).tolist()
-        inactive.update(cancelled)
-    return inactive
-
-
-def next_non_inactive(runs: List[int], inactive_set: set, start_from: int) -> Optional[int]:
-    if not runs:
+    if idx < 0 or idx >= len(df):
         return None
-    candidate = start_from
-    for _ in range(len(runs)):
-        if candidate not in inactive_set:
-            return candidate
-        candidate = next_run_wrap(runs, candidate)
-    return None
+    row = df.iloc[idx]
+    if is_active_row(row):
+        return row
+    new_idx = get_next_active_index(df, idx)
+    if new_idx < 0 or new_idx >= len(df):
+        return None
+    row = df.iloc[new_idx]
+    return row if is_active_row(row) else None
 
 
-def compute_now_on_next(runs: List[int], inactive_set: set, now_ptr: Optional[int]):
-    if now_ptr is None:
-        return (None, None, None)
-    now_ptr = next_non_inactive(runs, inactive_set, now_ptr)
-    if now_ptr is None:
-        return (None, None, None)
-    on_deck = next_non_inactive(runs, inactive_set, next_run_wrap(runs, now_ptr))
-    nxt = None
-    if on_deck is not None:
-        nxt = next_non_inactive(runs, inactive_set, next_run_wrap(runs, on_deck))
-    return (now_ptr, on_deck, nxt)
+def get_team_display(row):
+    handler_name = safe_str(row.get("Handler", "")) or "Handler"
+    dog_name = safe_str(row.get("Dog", ""))
+    breed = safe_str(row.get("Breed", ""))
+    return handler_name, dog_name, breed
 
 
-def normalize_pointers(state: SharedState, df: pd.DataFrame) -> None:
-    if df.empty or "Run Number" not in df.columns:
-        state.s1_now = None
-        state.s2_now = None
+def get_ro_display(row):
+    ro = safe_str(row.get("RO", ""))
+    return ro or "--"
+
+
+def render_mobile_card(
+    row,
+    bg_color,
+    text_color,
+    search_name="Search 1 - Theater",
+    hold=False,
+    hold_text="HOLD",
+    flash=False,
+):
+    flash_border = "8px solid #FDE047" if flash else "0px solid transparent"
+    flash_shadow = "0 0 0 6px rgba(253,224,71,.30)" if flash else "0 6px 16px rgba(0,0,0,.16)"
+    card_height = 360
+
+    if hold:
+        st.markdown(
+            f"""
+            <div style="
+                background:{bg_color};
+                color:{text_color};
+                border-radius:18px;
+                border:{flash_border};
+                padding:18px 12px;
+                min-height:{card_height}px;
+                display:flex;
+                flex-direction:column;
+                justify-content:center;
+                align-items:center;
+                text-align:center;
+                box-shadow:{flash_shadow};
+            ">
+                <div style="font-size:2rem; font-weight:900; margin-top:6px;">{hold_text}</div>
+                <div style="font-size:1rem; margin-top:14px; opacity:.92;">{search_name}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         return
-    runs = sorted(df["Run Number"].astype(int).tolist())
-    inactive_set = build_inactive_set(df, state.scratched)
 
-    def fix(ptr: Optional[int]) -> Optional[int]:
-        if ptr is None:
-            return None
-        ptr = clamp_to_existing(runs, int(ptr))
-        return next_non_inactive(runs, inactive_set, int(ptr))
+    if row is None:
+        st.markdown(
+            f"""
+            <div style="
+                background:{bg_color};
+                color:{text_color};
+                border-radius:18px;
+                border:{flash_border};
+                padding:18px 12px;
+                min-height:{card_height}px;
+                display:flex;
+                flex-direction:column;
+                justify-content:center;
+                align-items:center;
+                text-align:center;
+                box-shadow:{flash_shadow};
+            ">
+                <div style="font-size:1rem; font-weight:800;">{search_name}</div>
+                <div style="font-size:1rem; margin-top:14px;">No team loaded</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
 
-    state.s1_now = fix(state.s1_now)
-    state.s2_now = fix(state.s2_now)
+    handler_name, dog_name, breed = get_team_display(row)
+    ro_number = get_ro_display(row)
 
+    dog_html = ""
+    if dog_name:
+        dog_html += f"""
+        <div style="
+            font-size:1.1rem;
+            margin-top:10px;
+            font-weight:700;
+            line-height:1.15;
+        ">{dog_name}</div>
+        """
 
-def mode_from_url() -> str:
-    qp = st.query_params
-    m = qp.get("mode", "viewer")
-    if isinstance(m, list):
-        m = m[0]
-    return "admin" if str(m).lower().strip() == "admin" else "viewer"
+    if breed:
+        dog_html += f"""
+        <div style="
+            font-size:0.88rem;
+            margin-top:4px;
+            opacity:.88;
+            font-weight:500;
+            line-height:1.1;
+        ">{breed}</div>
+        """
 
-
-def big_text_colored(label: str, value: str, color: str):
     st.markdown(
-        f'''
-<div style="border-left: 12px solid {color};
-            padding: 12px 16px;
-            margin-bottom: 14px;
-            border-radius: 14px;
-            background: rgba(0,0,0,0.02);">
-  <div style="font-size: 13px; font-weight: 800; color: {color};
-              margin-bottom: 6px; letter-spacing: 0.4px;">{label}</div>
-  <div style="font-size: 30px; font-weight: 900; line-height: 1.15;">{value}</div>
-</div>
-''',
+        f"""
+        <div style="
+            background:{bg_color};
+            color:{text_color};
+            border-radius:18px;
+            border:{flash_border};
+            padding:16px 12px 18px 12px;
+            min-height:{card_height}px;
+            display:flex;
+            flex-direction:column;
+            justify-content:flex-start;
+            text-align:center;
+            box-shadow:{flash_shadow};
+        ">
+            <div style="
+                font-size:4.1rem;
+                line-height:1;
+                font-weight:900;
+                margin-top:4px;
+                margin-bottom:8px;
+            ">
+                {ro_number}
+            </div>
+
+            <div style="
+                font-size:0.95rem;
+                font-weight:800;
+                letter-spacing:.03em;
+                opacity:.96;
+                margin-bottom:16px;
+                word-break:break-word;
+            ">
+                {search_name}
+            </div>
+
+            <div style="
+                font-size:1.25rem;
+                line-height:1.15;
+                font-weight:900;
+                word-break:break-word;
+            ">
+                {handler_name}
+            </div>
+
+            {dog_html}
+        </div>
+        """,
         unsafe_allow_html=True,
     )
 
 
-def viewer_banner(state: SharedState):
-    items = []
-    if state.s1_start_time.strip():
-        items.append(f"**Search 1 start:** {state.s1_start_time.strip()}")
-    if state.s2_start_time.strip():
-        items.append(f"**Search 2 start:** {state.s2_start_time.strip()}")
-    if state.breaks_info.strip():
-        items.append(f"**Breaks:** {state.breaks_info.strip()}")
-    if state.end_of_search_info.strip():
-        items.append(f"**End of search:** {state.end_of_search_info.strip()}")
-    if state.message_board.strip():
-        items.append(f"**Message:** {state.message_board.strip()}")
-    if items:
-        st.info(" • ".join(items))
-
-
-def make_qr(data: str, box_size: int = 10, border: int = 2) -> Image.Image:
-    qr = qrcode.QRCode(
-        version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=box_size,
-        border=border,
-    )
-    qr.add_data(data)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    if hasattr(img, "get_image"):
-        img = img.get_image()
-    return img
-
-
-def show_qr_panel(title: str, url: str):
-    st.markdown(f"**{title}**")
-    st.code(url)
-    st.image(make_qr(url), use_container_width=False)
-
-
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.title(APP_TITLE)
-
-mode = mode_from_url()
-state = read_state()
-df = get_df_from_state(state)
-
-if mode == "viewer":
-    refresh_seconds = 2
-    st.caption(
-        f"Viewer mode • Auto-refresh ~{refresh_seconds}s • Updated: "
-        f"{time.strftime('%H:%M:%S', time.localtime(state.updated_at)) if state.updated_at else '—'}"
-    )
-
-with st.sidebar:
-    st.subheader("Mode")
-    if mode == "viewer":
-        st.write("✅ Viewer (read-only)")
-        st.write("Admin mode: add ?mode=admin to the URL.")
+def load_uploaded_file(uploaded_file):
+    filename = uploaded_file.name.lower()
+    if filename.endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
     else:
-        st.write("🔒 Admin")
-        pin = st.text_input("Admin PIN", type="password")
-        unlocked = pin == DEFAULT_ADMIN_PIN
-        if not unlocked:
-            st.warning("Enter PIN to unlock controls.")
-        else:
-            st.success("Admin unlocked.")
+        df = pd.read_excel(uploaded_file)
+    return split_uploaded_dataframe(df)
 
-        st.divider()
-        st.subheader("Roster")
-        uploaded = st.file_uploader("Upload running order (.xlsx)", type=["xlsx"])
-        if unlocked and uploaded:
-            try:
-                roster_df = load_app_ro_excel(uploaded)
-                state.roster_rows = roster_df.to_dict(orient="records")
-                add_log(state, "UPLOAD", "BOTH", None, "Roster uploaded")
-                normalize_pointers(state, roster_df)
-                write_state(state)
-                st.success("Roster loaded.")
-                df = roster_df
-            except Exception as e:
-                st.error(str(e))
 
-        st.subheader("Start Numbers")
-        s1_start = st.number_input("Search 1 start Run #", min_value=1, value=int(state.s1_start), step=1, disabled=not unlocked)
-        s2_start = st.number_input("Search 2 start Run #", min_value=1, value=int(state.s2_start), step=1, disabled=not unlocked)
+def build_display_label(row):
+    return f"RO {safe_str(row.get('RO', ''))} | {safe_str(row.get('Handler', ''))} | {safe_str(row.get('Dog', ''))} | {safe_str(row.get('Status', 'ACTIVE'))}"
 
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Reset", disabled=not unlocked):
-                state.started = False
-                state.s1_now = None
-                state.s2_now = None
-                state.scratched = []
-                state.log = []
-                state.s1_start = int(s1_start)
-                state.s2_start = int(s2_start)
-                add_log(state, "RESET", "BOTH", None)
-                write_state(state)
-                st.success("Reset done.")
-        with c2:
-            if st.button("Start", disabled=not unlocked):
-                if df.empty:
-                    st.error("Upload a roster first.")
-                else:
-                    runs = sorted(df["Run Number"].astype(int).tolist())
-                    state.s1_start = int(s1_start)
-                    state.s2_start = int(s2_start)
-                    state.s1_now = clamp_to_existing(runs, state.s1_start)
-                    state.s2_now = clamp_to_existing(runs, state.s2_start)
-                    state.started = True
-                    add_log(state, "START", "BOTH", None, f"S1={state.s1_now}, S2={state.s2_now}")
-                    normalize_pointers(state, df)
-                    write_state(state)
-                    st.success("Started.")
 
-        st.divider()
-        st.subheader("Event Info (shows to viewers)")
-        s1_time = st.text_input("Search 1 start time", value=state.s1_start_time, disabled=not unlocked, placeholder="e.g., 8:00 AM")
-        s2_time = st.text_input("Search 2 start time", value=state.s2_start_time, disabled=not unlocked, placeholder="e.g., 8:15 AM")
-        breaks = st.text_area("Breaks / schedule notes", value=state.breaks_info, disabled=not unlocked, height=90)
-        end_info = st.text_input("End of search info", value=state.end_of_search_info, disabled=not unlocked, placeholder="e.g., Search ends ~3:30 PM")
-        msg = st.text_area("Message board (announcements)", value=state.message_board, disabled=not unlocked, height=110)
-        if st.button("Save Event Info", disabled=not unlocked):
-            state.s1_start_time = s1_time
-            state.s2_start_time = s2_time
-            state.breaks_info = breaks
-            state.end_of_search_info = end_info
-            state.message_board = msg
-            add_log(state, "EVENT_INFO_UPDATE", "BOTH", None, "Updated banner")
-            write_state(state)
-            st.success("Saved.")
+def add_team(df: pd.DataFrame, ro_value: str, handler: str, dog: str, breed: str) -> pd.DataFrame:
+    df = df.copy()
+    ro_value = safe_str(ro_value)
+    if not ro_value:
+        existing_ros = pd.to_numeric(df["RO"], errors="coerce")
+        max_ro = int(existing_ros.max()) if existing_ros.notna().any() else 0
+        ro_value = str(max_ro + 1)
 
-        st.divider()
-        st.subheader("QR Codes")
-        public_base = st.text_input("Hosted app base URL", placeholder="https://your-app-url")
-        if unlocked:
-            with st.expander("Show QR Codes", expanded=False):
-                if public_base:
-                    viewer_url = public_base.rstrip("/") + "/"
-                    admin_url = viewer_url + "?mode=admin"
-                    show_qr_panel("Viewer", viewer_url)
-                    show_qr_panel("Admin", admin_url)
-                else:
-                    st.info("Enter your hosted app URL to generate QR codes.")
+    new_row = pd.DataFrame([
+        {
+            "RO": ro_value,
+            "Handler": safe_str(handler),
+            "Dog": safe_str(dog),
+            "Breed": safe_str(breed),
+            "Status": "ACTIVE",
+        }
+    ])
+    df = pd.concat([df, new_row], ignore_index=True)
+    return ensure_required_columns(df)
 
-if df.empty:
-    st.info("Admin: upload the Excel roster in admin mode. Viewers: wait for admin to load roster.")
+
+# ----------------------------
+# HEADER / FILE LOAD
+# ----------------------------
+st.title("K9SF Running Order")
+st.caption("Manual, editable, live event board for day-of-trial changes.")
+
+uploaded_file = st.file_uploader(
+    "Upload running order (.xlsx, .xls, or .csv)",
+    type=["xlsx", "xls", "csv"],
+)
+
+if uploaded_file is not None:
+    incoming_name = uploaded_file.name
+    if st.session_state.source_filename != incoming_name or st.session_state.left_df is None or st.session_state.right_df is None:
+        try:
+            new_left_df, new_right_df = load_uploaded_file(uploaded_file)
+            st.session_state.left_df = new_left_df
+            st.session_state.right_df = new_right_df
+            st.session_state.left_index = first_active_index(new_left_df)
+            st.session_state.right_index = first_active_index(new_right_df)
+            st.session_state.source_filename = incoming_name
+        except Exception as e:
+            st.error(f"Could not read file: {e}")
+            st.stop()
+
+left_df = st.session_state.left_df
+right_df = st.session_state.right_df
+
+if left_df is None or right_df is None:
+    st.info("Upload your running order file to begin.")
     st.stop()
 
-runs = sorted(df["Run Number"].astype(int).tolist())
-inactive_set = build_inactive_set(df, state.scratched)
-viewer_banner(state)
 
+# ----------------------------
+# PUBLIC / MOBILE VIEWER
+# ----------------------------
+left_row = get_display_row(left_df, st.session_state.left_index)
+right_row = get_display_row(right_df, st.session_state.right_index)
 
-def do_advance(search: str, complete: bool, hold: bool = False):
-    now_ptr = state.s1_now if search == "S1" else state.s2_now
-    if now_ptr is None:
-        return
-    if hold:
-        add_log(state, "HOLD", search, now_ptr)
-    elif complete:
-        add_log(state, "COMPLETE", search, now_ptr)
-    else:
-        add_log(state, "SKIP", search, now_ptr)
-    nxt = next_run_wrap(runs, int(now_ptr))
-    nxt = next_non_inactive(runs, inactive_set, int(nxt))
-    if search == "S1":
-        state.s1_now = nxt
-    else:
-        state.s2_now = nxt
-    write_state(state)
+st.markdown(
+    """
+    <style>
+    div[data-testid="stHorizontalBlock"] > div {
+        align-items: stretch !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
+view_wrap = st.container()
+with view_wrap:
+    col1, col2 = st.columns(2, gap="small")
 
-def do_jump(search: str, desired: int):
-    j = clamp_to_existing(runs, desired)
-    j = next_non_inactive(runs, inactive_set, int(j))
-    if search == "S1":
-        state.s1_now = j
-    else:
-        state.s2_now = j
-    add_log(state, "JUMP", search, j, f"Requested {desired}")
-    write_state(state)
-
-
-def do_scratch(run_num: int):
-    rn = int(run_num)
-    if rn not in set(state.scratched or []):
-        state.scratched = sorted(list(set(state.scratched or []) | {rn}))
-        add_log(state, "SCRATCH", "BOTH", rn)
-        normalize_pointers(state, df)
-        write_state(state)
-
-
-left, right = st.columns(2)
-
-def render_search(col, label, ptr, search_key):
-    with col:
-        color = SEARCH1_COLOR if search_key == "s1" else SEARCH2_COLOR
-        label_prefix = "SEARCH 1" if search_key == "s1" else "SEARCH 2"
-        st.subheader(label)
-        now_ptr, on_deck, nxt = compute_now_on_next(runs, inactive_set, ptr)
-        if now_ptr is None:
-            st.warning("No runs available (all cancelled/scratched?).")
-            return
-        now_row = get_row(df, int(now_ptr))
-        on_row = get_row(df, int(on_deck)) if on_deck is not None else None
-        nxt_row = get_row(df, int(nxt)) if nxt is not None else None
-
-        big_text_colored(f"{label_prefix} • NOW UP", team_string(now_row) if now_row is not None else str(now_ptr), color)
-        big_text_colored("ON DECK", team_string(on_row) if on_row is not None else "—", color)
-        big_text_colored("NEXT", team_string(nxt_row) if nxt_row is not None else "—", color)
-
-        if mode == "admin":
-            b1, b2, b3 = st.columns(3)
-            with b1:
-                if st.button(f"Advance {label}", key=f"{search_key}_adv"):
-                    do_advance("S1" if search_key == "s1" else "S2", complete=True)
-            with b2:
-                if st.button(f"Skip {label}", key=f"{search_key}_skip"):
-                    do_advance("S1" if search_key == "s1" else "S2", complete=False)
-            with b3:
-                if st.button(f"Hold {label}", key=f"{search_key}_hold"):
-                    do_advance("S1" if search_key == "s1" else "S2", complete=False, hold=True)
-
-            j1, j2 = st.columns([2, 1])
-            with j1:
-                desired = st.number_input(f"Jump {label} to Run #", min_value=1, value=int(now_ptr), step=1, key=f"{search_key}_jumpnum")
-            with j2:
-                if st.button("Jump", key=f"{search_key}_jumpbtn"):
-                    do_jump("S1" if search_key == "s1" else "S2", int(desired))
-
-render_search(left, "Search 1", state.s1_now, "s1")
-render_search(right, "Search 2", state.s2_now, "s2")
-
-st.divider()
-
-if mode == "admin":
-    st.subheader("Edit Running Order (Admin)")
-    st.caption("Use Cancel for withdrawals/cancellations. Use Insert to add a team and shift run numbers down.")
-    tab1, tab2, tab3 = st.tabs(["Quick Edit Table", "Cancel / Delete", "Insert Team"])
-
-    with tab1:
-        edit_df = df.copy().sort_values("Run Number").reset_index(drop=True)
-        edited = st.data_editor(
-            edit_df,
-            use_container_width=True,
-            num_rows="dynamic",
-            disabled=["Run Number"],
-            column_config={"Status": st.column_config.SelectboxColumn("Status", options=["Active", "Cancelled"], required=True)},
+    with col1:
+        render_mobile_card(
+            row=left_row,
+            bg_color=st.session_state.left_color,
+            text_color=st.session_state.text_color,
+            search_name=st.session_state.left_search_name,
+            hold=st.session_state.left_hold,
+            hold_text=st.session_state.left_status_text,
+            flash=st.session_state.left_flash,
         )
-        if st.button("Save table changes"):
-            state.roster_rows = edited.to_dict(orient="records")
-            add_log(state, "ROSTER_EDIT_TABLE", "BOTH", None, "Saved edits")
-            df2 = get_df_from_state(state)
-            normalize_pointers(state, df2)
-            write_state(state)
-            st.success("Saved.")
 
-    with tab2:
-        c1, c2 = st.columns(2)
-        with c1:
-            rn_cancel = st.number_input("Run # to CANCEL", min_value=1, value=1, step=1, key="rn_cancel")
-            if st.button("Cancel run #"):
-                df2 = df.copy()
-                if (df2["Run Number"] == int(rn_cancel)).any():
-                    df2.loc[df2["Run Number"] == int(rn_cancel), "Status"] = "Cancelled"
-                    state.roster_rows = df2.to_dict(orient="records")
-                    add_log(state, "CANCEL_RUN", "BOTH", int(rn_cancel))
-                    normalize_pointers(state, df2)
-                    write_state(state)
-                    st.success(f"Cancelled Run #{int(rn_cancel)}")
-                else:
-                    st.error("Run number not found.")
-        with c2:
-            rn_delete = st.number_input("Run # to DELETE (hard)", min_value=1, value=1, step=1, key="rn_delete")
-            if st.button("Delete run # (hard)"):
-                df2 = df[df["Run Number"] != int(rn_delete)].copy()
-                if len(df2) == len(df):
-                    st.error("Run number not found.")
-                else:
-                    state.roster_rows = df2.to_dict(orient="records")
-                    add_log(state, "DELETE_RUN", "BOTH", int(rn_delete))
-                    normalize_pointers(state, df2)
-                    write_state(state)
-                    st.success(f"Deleted Run #{int(rn_delete)}")
-        st.markdown("**Scratch quick tool:**")
-        scr = st.number_input("Scratch Run #", min_value=1, value=1, step=1, key="scratch_num")
-        if st.button("Scratch"):
-            do_scratch(int(scr))
-            st.success(f"Scratched Run #{int(scr)}")
+    with col2:
+        render_mobile_card(
+            row=right_row,
+            bg_color=st.session_state.right_color,
+            text_color=st.session_state.text_color,
+            search_name=st.session_state.right_search_name,
+            hold=st.session_state.right_hold,
+            hold_text=st.session_state.right_status_text,
+            flash=st.session_state.right_flash,
+        )
 
-    with tab3:
-        st.markdown("Insert a new team at a run number (shifts existing run numbers down by 1).")
-        ins_rn = st.number_input("Insert at Run #", min_value=1, value=1, step=1, key="ins_rn")
-        c1, c2 = st.columns(2)
-        with c1:
-            ins_last = st.text_input("Handler Last Name", key="ins_last")
-            ins_first = st.text_input("Handler First Name", key="ins_first")
-            ins_dog = st.text_input("Dog Call Name", key="ins_dog")
-        with c2:
-            ins_breed = st.text_input("Breed", key="ins_breed")
-            ins_notes = st.text_input("Notes (optional)", key="ins_notes")
-        if st.button("Insert team now"):
-            df2 = df.copy()
-            for col in ["Handler Last Name", "Handler First Name", "Dog Call Name", "Breed", "Status"]:
-                if col not in df2.columns:
-                    df2[col] = "" if col != "Status" else "Active"
-            df2.loc[df2["Run Number"] >= int(ins_rn), "Run Number"] = df2.loc[df2["Run Number"] >= int(ins_rn), "Run Number"] + 1
-            new_row = {
-                "Run Number": int(ins_rn),
-                "Handler Last Name": ins_last,
-                "Handler First Name": ins_first,
-                "Dog Call Name": ins_dog,
-                "Breed": ins_breed,
-                "Status": "Active",
-            }
-            if "Notes" in df2.columns or ins_notes.strip():
-                if "Notes" not in df2.columns:
-                    df2["Notes"] = ""
-                new_row["Notes"] = ins_notes.strip()
-            df2 = pd.concat([df2, pd.DataFrame([new_row])], ignore_index=True)
-            df2 = df2.sort_values("Run Number").reset_index(drop=True)
-            state.roster_rows = df2.to_dict(orient="records")
-            add_log(state, "INSERT_TEAM", "BOTH", int(ins_rn), f"{ins_first} {ins_last} / {ins_dog}")
-            normalize_pointers(state, df2)
-            write_state(state)
-            st.success(f"Inserted team at Run #{int(ins_rn)}")
+if st.session_state.left_flash or st.session_state.right_flash:
+    time.sleep(0.35)
 
-    st.divider()
-    st.subheader("Action Log / Export")
-    log_df = pd.DataFrame(state.log or [])
-    st.dataframe(log_df, use_container_width=True)
-    csv = log_df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download log CSV", csv, file_name="running_order_log.csv", mime="text/csv")
-else:
-    st.caption("Viewer mode is read-only. Ask the admin if something needs to change.")
+st.session_state.left_flash = False
+st.session_state.right_flash = False
 
 
+# ----------------------------
+# ADMIN CONTROLS
+# ----------------------------
+st.markdown("---")
+st.subheader("Admin Controls")
+admin_left, admin_right = st.columns(2, gap="large")
+
+# LEFT / SEARCH 1
+with admin_left:
+    st.markdown("### Search 1")
+    st.session_state.left_search_name = st.text_input(
+        "Search Label (editable anytime)",
+        value=st.session_state.left_search_name,
+        key="left_search_name_input",
+        help="Example: Search 1 - Theater",
+    )
+    st.session_state.left_search_description = st.text_input(
+        "Search Description",
+        value=st.session_state.left_search_description,
+        key="left_search_description_input",
+    )
+    st.session_state.left_color = st.color_picker(
+        "Search 1 Screen Color",
+        value=st.session_state.left_color,
+        key="left_color_picker",
+    )
+    st.session_state.left_status_text = st.selectbox(
+        "Search 1 Hold Text",
+        ["HOLD", "PAUSED"],
+        index=0 if st.session_state.left_status_text == "HOLD" else 1,
+        key="left_hold_text_select",
+    )
+
+    lnav1, lnav2, lnav3 = st.columns(3)
+    with lnav1:
+        if st.button("◀ Search 1 Back", use_container_width=True):
+            if left_df is not None and not left_df.empty:
+                new_idx = get_prev_active_index(left_df, st.session_state.left_index - 1)
+                st.session_state.left_index = max(0, new_idx)
+                st.session_state.left_flash = True
+                st.rerun()
+    with lnav2:
+        if st.button("Search 1 Next ▶", use_container_width=True):
+            if left_df is not None and not left_df.empty:
+                next_start = st.session_state.left_index + 1
+                if next_start < len(left_df):
+                    st.session_state.left_index = get_next_active_index(left_df, next_start)
+                    st.session_state.left_flash = True
+                    st.rerun()
+    with lnav3:
+        if st.button("Search 1 Reset", use_container_width=True):
+            st.session_state.left_index = first_active_index(left_df)
+            st.session_state.left_hold = False
+            st.session_state.left_flash = True
+            st.rerun()
+
+    st.session_state.left_hold = st.toggle(
+        "Search 1 HOLD / PAUSE",
+        value=st.session_state.left_hold,
+        key="left_hold_toggle",
+    )
+    st.caption(f"Current Search 1 index: {st.session_state.left_index}")
+
+    st.markdown("#### Edit Search 1 Running Order")
+    left_editor_df = left_df.copy()
+    left_editor_df["Display"] = left_editor_df.apply(build_display_label, axis=1)
+    left_options = left_editor_df["Display"].tolist()
+
+    if left_options:
+        selected_left_display = st.selectbox(
+            "Select Search 1 Entry",
+            options=left_options,
+            key="left_entry_select",
+        )
+        left_selected_idx = left_editor_df.index[left_editor_df["Display"] == selected_left_display][0]
+
+        le1, le2, le3 = st.columns(3)
+        with le1:
+            if st.button("Scratch Entry", key="scratch_left", use_container_width=True):
+                left_df.at[left_selected_idx, "Status"] = "SCRATCH"
+                st.session_state.left_df = ensure_required_columns(left_df)
+                if left_selected_idx == st.session_state.left_index:
+                    next_idx = get_next_active_index(st.session_state.left_df, left_selected_idx + 1)
+                    st.session_state.left_index = max(0, next_idx)
+                st.rerun()
+        with le2:
+            if st.button("Restore Entry", key="restore_left", use_container_width=True):
+                left_df.at[left_selected_idx, "Status"] = "ACTIVE"
+                st.session_state.left_df = ensure_required_columns(left_df)
+                st.rerun()
+        with le3:
+            if st.button("Delete Entry", key="delete_left", use_container_width=True):
+                left_df = left_df.drop(index=left_selected_idx).reset_index(drop=True)
+                left_df = ensure_required_columns(left_df)
+                st.session_state.left_df = left_df
+                if len(left_df) == 0:
+                    st.session_state.left_index = 0
+                elif st.session_state.left_index >= len(left_df):
+                    st.session_state.left_index = len(left_df) - 1
+                st.rerun()
+
+    st.markdown("#### Add Search 1 Team")
+    new_left_ro = st.text_input("New Search 1 RO", key="new_left_ro")
+    new_left_handler = st.text_input("New Search 1 Handler", key="new_left_handler")
+    new_left_dog = st.text_input("New Search 1 Dog", key="new_left_dog")
+    new_left_breed = st.text_input("New Search 1 Breed", key="new_left_breed")
+
+    if st.button("Add Search 1 Team", key="add_left_team", use_container_width=True):
+        st.session_state.left_df = add_team(
+            left_df,
+            new_left_ro,
+            new_left_handler,
+            new_left_dog,
+            new_left_breed,
+        )
+        st.rerun()
+
+
+# RIGHT / SEARCH 2
+with admin_right:
+    st.markdown("### Search 2")
+    st.session_state.right_search_name = st.text_input(
+        "Search Label (editable anytime)",
+        value=st.session_state.right_search_name,
+        key="right_search_name_input",
+        help="Example: Search 2 - Vehicles",
+    )
+    st.session_state.right_search_description = st.text_input(
+        "Search Description",
+        value=st.session_state.right_search_description,
+        key="right_search_description_input",
+    )
+    st.session_state.right_color = st.color_picker(
+        "Search 2 Screen Color",
+        value=st.session_state.right_color,
+        key="right_color_picker",
+    )
+    st.session_state.right_status_text = st.selectbox(
+        "Search 2 Hold Text",
+        ["HOLD", "PAUSED"],
+        index=0 if st.session_state.right_status_text == "HOLD" else 1,
+        key="right_hold_text_select",
+    )
+
+    rnav1, rnav2, rnav3 = st.columns(3)
+    with rnav1:
+        if st.button("◀ Search 2 Back", use_container_width=True):
+            if right_df is not None and not right_df.empty:
+                new_idx = get_prev_active_index(right_df, st.session_state.right_index - 1)
+                st.session_state.right_index = max(0, new_idx)
+                st.session_state.right_flash = True
+                st.rerun()
+    with rnav2:
+        if st.button("Search 2 Next ▶", use_container_width=True):
+            if right_df is not None and not right_df.empty:
+                next_start = st.session_state.right_index + 1
+                if next_start < len(right_df):
+                    st.session_state.right_index = get_next_active_index(right_df, next_start)
+                    st.session_state.right_flash = True
+                    st.rerun()
+    with rnav3:
+        if st.button("Search 2 Reset", use_container_width=True):
+            st.session_state.right_index = first_active_index(right_df)
+            st.session_state.right_hold = False
+            st.session_state.right_flash = True
+            st.rerun()
+
+    st.session_state.right_hold = st.toggle(
+        "Search 2 HOLD / PAUSE",
+        value=st.session_state.right_hold,
+        key="right_hold_toggle",
+    )
+    st.caption(f"Current Search 2 index: {st.session_state.right_index}")
+
+    st.markdown("#### Edit Search 2 Running Order")
+    right_editor_df = right_df.copy()
+    right_editor_df["Display"] = right_editor_df.apply(build_display_label, axis=1)
+    right_options = right_editor_df["Display"].tolist()
+
+    if right_options:
+        selected_right_display = st.selectbox(
+            "Select Search 2 Entry",
+            options=right_options,
+            key="right_entry_select",
+        )
+        right_selected_idx = right_editor_df.index[right_editor_df["Display"] == selected_right_display][0]
+
+        re1, re2, re3 = st.columns(3)
+        with re1:
+            if st.button("Scratch Entry", key="scratch_right", use_container_width=True):
+                right_df.at[right_selected_idx, "Status"] = "SCRATCH"
+                st.session_state.right_df = ensure_required_columns(right_df)
+                if right_selected_idx == st.session_state.right_index:
+                    next_idx = get_next_active_index(st.session_state.right_df, right_selected_idx + 1)
+                    st.session_state.right_index = max(0, next_idx)
+                st.rerun()
+        with re2:
+            if st.button("Restore Entry", key="restore_right", use_container_width=True):
+                right_df.at[right_selected_idx, "Status"] = "ACTIVE"
+                st.session_state.right_df = ensure_required_columns(right_df)
+                st.rerun()
+        with re3:
+            if st.button("Delete Entry", key="delete_right", use_container_width=True):
+                right_df = right_df.drop(index=right_selected_idx).reset_index(drop=True)
+                right_df = ensure_required_columns(right_df)
+                st.session_state.right_df = right_df
+                if len(right_df) == 0:
+                    st.session_state.right_index = 0
+                elif st.session_state.right_index >= len(right_df):
+                    st.session_state.right_index = len(right_df) - 1
+                st.rerun()
+
+    st.markdown("#### Add Search 2 Team")
+    new_right_ro = st.text_input("New Search 2 RO", key="new_right_ro")
+    new_right_handler = st.text_input("New Search 2 Handler", key="new_right_handler")
+    new_right_dog = st.text_input("New Search 2 Dog", key="new_right_dog")
+    new_right_breed = st.text_input("New Search 2 Breed", key="new_right_breed")
+
+    if st.button("Add Search 2 Team", key="add_right_team", use_container_width=True):
+        st.session_state.right_df = add_team(
+            right_df,
+            new_right_ro,
+            new_right_handler,
+            new_right_dog,
+            new_right_breed,
+        )
+        st.rerun()
+
+
+# ----------------------------
+# OPTIONAL ADMIN DATA PREVIEW
+# ----------------------------
+with st.expander("Show working running order tables"):
+    prev1, prev2 = st.columns(2)
+    with prev1:
+        st.markdown("**Search 1 Table**")
+        st.dataframe(st.session_state.left_df, use_container_width=True, hide_index=True)
+    with prev2:
+        st.markdown("**Search 2 Table**")
+        st.dataframe(st.session_state.right_df, use_container_width=True, hide_index=True)
