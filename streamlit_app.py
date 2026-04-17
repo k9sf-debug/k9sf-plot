@@ -28,9 +28,8 @@ def init_ro_state():
         "left_search_name": "Search 1",
         "right_search_name": "Search 2",
         "left_search_description": "",
-        "right_search_description": "",
-        "left_df": None,
-        "right_df": None,
+        "right_search_description": "",        "master_df": None,
+
         "source_filename": None,
     }
     for k, v in defaults.items():
@@ -91,34 +90,14 @@ def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=rename_map)
 
 
-def split_uploaded_dataframe(df: pd.DataFrame):
+def load_uploaded_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Splits uploaded running order into two panels.
-    Preferred formats:
-    1) Columns named Side/Search/Panel/Lane with values left/right or 1/2.
-    2) Columns already filtered externally and user uploads a file with both halves identified.
-    Fallback: split the file in half.
+    Load one master running order shared by both searches.
+    Both Search 1 and Search 2 use the SAME team list.
+    Each search has its own current index/pointer.
     """
     df = standardize_columns(df)
-    original = df.copy()
-
-    side_col = None
-    for c in original.columns:
-        key = safe_str(c).lower()
-        if key in {"side", "search", "panel", "lane", "group"}:
-            side_col = c
-            break
-
-    if side_col:
-        side_vals = original[side_col].fillna("").astype(str).str.strip().str.lower()
-        left_mask = side_vals.isin(["left", "l", "1", "search 1", "side 1", "lane 1", "panel 1", "a"])
-        right_mask = side_vals.isin(["right", "r", "2", "search 2", "side 2", "lane 2", "panel 2", "b"])
-
-        left_df = original[left_mask].drop(columns=[side_col], errors="ignore").reset_index(drop=True)
-        right_df = original[right_mask].drop(columns=[side_col], errors="ignore").reset_index(drop=True)
-
-        if not left_df.empty or not right_df.empty:
-            return ensure_required_columns(left_df), ensure_required_columns(right_df)
+    return ensure_required_columns(df.reset_index(drop=True))
 
     # fallback: split in half
     midpoint = (len(original) + 1) // 2
@@ -333,7 +312,7 @@ def load_uploaded_file(uploaded_file):
         df = pd.read_csv(uploaded_file)
     else:
         df = pd.read_excel(uploaded_file)
-    return split_uploaded_dataframe(df)
+    return load_uploaded_dataframe(df)
 
 
 def build_display_label(row):
@@ -367,6 +346,18 @@ def add_team(df: pd.DataFrame, ro_value: str, handler: str, dog: str, breed: str
 st.title("K9SF Running Order")
 st.caption("Manual, editable, live event board for day-of-trial changes.")
 
+mode = st.sidebar.radio(
+    "View",
+    ["Public Display", "Admin"],
+    index=0,
+    help="Use Public Display on the phone-facing screen. Use Admin on the control device.",
+)
+
+if mode == "Public Display":
+    st.sidebar.success("Public Display mode")
+else:
+    st.sidebar.warning("Admin mode")
+
 uploaded_file = st.file_uploader(
     "Upload running order (.xlsx, .xls, or .csv)",
     type=["xlsx", "xls", "csv"],
@@ -374,22 +365,20 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is not None:
     incoming_name = uploaded_file.name
-    if st.session_state.source_filename != incoming_name or st.session_state.left_df is None or st.session_state.right_df is None:
+    if st.session_state.source_filename != incoming_name or st.session_state.master_df is None:
         try:
-            new_left_df, new_right_df = load_uploaded_file(uploaded_file)
-            st.session_state.left_df = new_left_df
-            st.session_state.right_df = new_right_df
-            st.session_state.left_index = first_active_index(new_left_df)
-            st.session_state.right_index = first_active_index(new_right_df)
+            master_df = load_uploaded_file(uploaded_file)
+            st.session_state.master_df = master_df
+            st.session_state.left_index = first_active_index(master_df)
+            st.session_state.right_index = first_active_index(master_df)
             st.session_state.source_filename = incoming_name
         except Exception as e:
             st.error(f"Could not read file: {e}")
             st.stop()
 
-left_df = st.session_state.left_df
-right_df = st.session_state.right_df
+master_df = st.session_state.master_df
 
-if left_df is None or right_df is None:
+if master_df is None:
     st.info("Upload your running order file to begin.")
     st.stop()
 
@@ -397,22 +386,29 @@ if left_df is None or right_df is None:
 # ----------------------------
 # PUBLIC / MOBILE VIEWER
 # ----------------------------
-left_row = get_display_row(left_df, st.session_state.left_index)
-right_row = get_display_row(right_df, st.session_state.right_index)
+left_row = get_display_row(master_df, st.session_state.left_index)
+right_row = get_display_row(master_df, st.session_state.right_index)
 
-st.markdown(
-    """
-    <style>
-    div[data-testid="stHorizontalBlock"] > div {
-        align-items: stretch !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+if mode == "Public Display":
+    st.markdown(
+        """
+        <style>
+        section[data-testid="stSidebar"] {display: none !important;}
+        div[data-testid="stHorizontalBlock"] > div {
+            align-items: stretch !important;
+        }
+        .block-container {
+            padding-top: 1rem;
+            padding-bottom: 1rem;
+            padding-left: 1rem;
+            padding-right: 1rem;
+            max-width: 100%;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-view_wrap = st.container()
-with view_wrap:
     col1, col2 = st.columns(2, gap="small")
 
     with col1:
@@ -437,12 +433,12 @@ with view_wrap:
             flash=st.session_state.right_flash,
         )
 
-if st.session_state.left_flash or st.session_state.right_flash:
-    time.sleep(0.35)
+    if st.session_state.left_flash or st.session_state.right_flash:
+        time.sleep(0.35)
 
-st.session_state.left_flash = False
-st.session_state.right_flash = False
-
+    st.session_state.left_flash = False
+    st.session_state.right_flash = False
+    st.stop()
 
 # ----------------------------
 # ADMIN CONTROLS
@@ -480,22 +476,22 @@ with admin_left:
     lnav1, lnav2, lnav3 = st.columns(3)
     with lnav1:
         if st.button("◀ Search 1 Back", use_container_width=True):
-            if left_df is not None and not left_df.empty:
-                new_idx = get_prev_active_index(left_df, st.session_state.left_index - 1)
+            if master_df is not None and not master_df.empty:
+                new_idx = get_prev_active_index(master_df, st.session_state.left_index - 1)
                 st.session_state.left_index = max(0, new_idx)
                 st.session_state.left_flash = True
                 st.rerun()
     with lnav2:
         if st.button("Search 1 Next ▶", use_container_width=True):
-            if left_df is not None and not left_df.empty:
+            if master_df is not None and not master_df.empty:
                 next_start = st.session_state.left_index + 1
-                if next_start < len(left_df):
-                    st.session_state.left_index = get_next_active_index(left_df, next_start)
+                if next_start < len(master_df):
+                    st.session_state.left_index = get_next_active_index(master_df, next_start)
                     st.session_state.left_flash = True
                     st.rerun()
     with lnav3:
         if st.button("Search 1 Reset", use_container_width=True):
-            st.session_state.left_index = first_active_index(left_df)
+            st.session_state.left_index = first_active_index(master_df)
             st.session_state.left_hold = False
             st.session_state.left_flash = True
             st.rerun()
@@ -508,7 +504,7 @@ with admin_left:
     st.caption(f"Current Search 1 index: {st.session_state.left_index}")
 
     st.markdown("#### Edit Search 1 Running Order")
-    left_editor_df = left_df.copy()
+    left_editor_df = master_df.copy()
     left_editor_df["Display"] = left_editor_df.apply(build_display_label, axis=1)
     left_options = left_editor_df["Display"].tolist()
 
@@ -523,26 +519,30 @@ with admin_left:
         le1, le2, le3 = st.columns(3)
         with le1:
             if st.button("Scratch Entry", key="scratch_left", use_container_width=True):
-                left_df.at[left_selected_idx, "Status"] = "SCRATCH"
-                st.session_state.left_df = ensure_required_columns(left_df)
+                master_df.at[left_selected_idx, "Status"] = "SCRATCH"
+                st.session_state.master_df = ensure_required_columns(master_df)
                 if left_selected_idx == st.session_state.left_index:
-                    next_idx = get_next_active_index(st.session_state.left_df, left_selected_idx + 1)
+                    next_idx = get_next_active_index(st.session_state.master_df, left_selected_idx + 1)
                     st.session_state.left_index = max(0, next_idx)
                 st.rerun()
         with le2:
             if st.button("Restore Entry", key="restore_left", use_container_width=True):
-                left_df.at[left_selected_idx, "Status"] = "ACTIVE"
-                st.session_state.left_df = ensure_required_columns(left_df)
+                master_df.at[left_selected_idx, "Status"] = "ACTIVE"
+                st.session_state.master_df = ensure_required_columns(master_df)
                 st.rerun()
         with le3:
             if st.button("Delete Entry", key="delete_left", use_container_width=True):
-                left_df = left_df.drop(index=left_selected_idx).reset_index(drop=True)
-                left_df = ensure_required_columns(left_df)
-                st.session_state.left_df = left_df
-                if len(left_df) == 0:
+                master_df = master_df.drop(index=left_selected_idx).reset_index(drop=True)
+                master_df = ensure_required_columns(master_df)
+                st.session_state.master_df = master_df
+                if len(master_df) == 0:
                     st.session_state.left_index = 0
-                elif st.session_state.left_index >= len(left_df):
-                    st.session_state.left_index = len(left_df) - 1
+                    st.session_state.right_index = 0
+                else:
+                    if st.session_state.left_index >= len(master_df):
+                        st.session_state.left_index = len(master_df) - 1
+                    if st.session_state.right_index >= len(master_df):
+                        st.session_state.right_index = len(master_df) - 1
                 st.rerun()
 
     st.markdown("#### Add Search 1 Team")
@@ -552,8 +552,8 @@ with admin_left:
     new_left_breed = st.text_input("New Search 1 Breed", key="new_left_breed")
 
     if st.button("Add Search 1 Team", key="add_left_team", use_container_width=True):
-        st.session_state.left_df = add_team(
-            left_df,
+        st.session_state.master_df = add_team(
+            master_df,
             new_left_ro,
             new_left_handler,
             new_left_dog,
@@ -591,22 +591,22 @@ with admin_right:
     rnav1, rnav2, rnav3 = st.columns(3)
     with rnav1:
         if st.button("◀ Search 2 Back", use_container_width=True):
-            if right_df is not None and not right_df.empty:
-                new_idx = get_prev_active_index(right_df, st.session_state.right_index - 1)
+            if master_df is not None and not master_df.empty:
+                new_idx = get_prev_active_index(master_df, st.session_state.right_index - 1)
                 st.session_state.right_index = max(0, new_idx)
                 st.session_state.right_flash = True
                 st.rerun()
     with rnav2:
         if st.button("Search 2 Next ▶", use_container_width=True):
-            if right_df is not None and not right_df.empty:
+            if master_df is not None and not master_df.empty:
                 next_start = st.session_state.right_index + 1
-                if next_start < len(right_df):
-                    st.session_state.right_index = get_next_active_index(right_df, next_start)
+                if next_start < len(master_df):
+                    st.session_state.right_index = get_next_active_index(master_df, next_start)
                     st.session_state.right_flash = True
                     st.rerun()
     with rnav3:
         if st.button("Search 2 Reset", use_container_width=True):
-            st.session_state.right_index = first_active_index(right_df)
+            st.session_state.right_index = first_active_index(master_df)
             st.session_state.right_hold = False
             st.session_state.right_flash = True
             st.rerun()
@@ -619,7 +619,7 @@ with admin_right:
     st.caption(f"Current Search 2 index: {st.session_state.right_index}")
 
     st.markdown("#### Edit Search 2 Running Order")
-    right_editor_df = right_df.copy()
+    right_editor_df = master_df.copy()
     right_editor_df["Display"] = right_editor_df.apply(build_display_label, axis=1)
     right_options = right_editor_df["Display"].tolist()
 
@@ -634,26 +634,30 @@ with admin_right:
         re1, re2, re3 = st.columns(3)
         with re1:
             if st.button("Scratch Entry", key="scratch_right", use_container_width=True):
-                right_df.at[right_selected_idx, "Status"] = "SCRATCH"
-                st.session_state.right_df = ensure_required_columns(right_df)
+                master_df.at[right_selected_idx, "Status"] = "SCRATCH"
+                st.session_state.master_df = ensure_required_columns(master_df)
                 if right_selected_idx == st.session_state.right_index:
-                    next_idx = get_next_active_index(st.session_state.right_df, right_selected_idx + 1)
+                    next_idx = get_next_active_index(st.session_state.master_df, right_selected_idx + 1)
                     st.session_state.right_index = max(0, next_idx)
                 st.rerun()
         with re2:
             if st.button("Restore Entry", key="restore_right", use_container_width=True):
-                right_df.at[right_selected_idx, "Status"] = "ACTIVE"
-                st.session_state.right_df = ensure_required_columns(right_df)
+                master_df.at[right_selected_idx, "Status"] = "ACTIVE"
+                st.session_state.master_df = ensure_required_columns(master_df)
                 st.rerun()
         with re3:
             if st.button("Delete Entry", key="delete_right", use_container_width=True):
-                right_df = right_df.drop(index=right_selected_idx).reset_index(drop=True)
-                right_df = ensure_required_columns(right_df)
-                st.session_state.right_df = right_df
-                if len(right_df) == 0:
+                master_df = master_df.drop(index=right_selected_idx).reset_index(drop=True)
+                master_df = ensure_required_columns(master_df)
+                st.session_state.master_df = master_df
+                if len(master_df) == 0:
+                    st.session_state.left_index = 0
                     st.session_state.right_index = 0
-                elif st.session_state.right_index >= len(right_df):
-                    st.session_state.right_index = len(right_df) - 1
+                else:
+                    if st.session_state.left_index >= len(master_df):
+                        st.session_state.left_index = len(master_df) - 1
+                    if st.session_state.right_index >= len(master_df):
+                        st.session_state.right_index = len(master_df) - 1
                 st.rerun()
 
     st.markdown("#### Add Search 2 Team")
@@ -663,8 +667,8 @@ with admin_right:
     new_right_breed = st.text_input("New Search 2 Breed", key="new_right_breed")
 
     if st.button("Add Search 2 Team", key="add_right_team", use_container_width=True):
-        st.session_state.right_df = add_team(
-            right_df,
+        st.session_state.master_df = add_team(
+            master_df,
             new_right_ro,
             new_right_handler,
             new_right_dog,
@@ -676,11 +680,6 @@ with admin_right:
 # ----------------------------
 # OPTIONAL ADMIN DATA PREVIEW
 # ----------------------------
-with st.expander("Show working running order tables"):
-    prev1, prev2 = st.columns(2)
-    with prev1:
-        st.markdown("**Search 1 Table**")
-        st.dataframe(st.session_state.left_df, use_container_width=True, hide_index=True)
-    with prev2:
-        st.markdown("**Search 2 Table**")
-        st.dataframe(st.session_state.right_df, use_container_width=True, hide_index=True)
+with st.expander("Show working running order table"):
+    st.markdown("**Master Running Order Table**")
+    st.dataframe(st.session_state.master_df, use_container_width=True, hide_index=True)
