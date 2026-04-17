@@ -319,6 +319,34 @@ def build_display_label(row):
     return f"RO {safe_str(row.get('RO', ''))} | {safe_str(row.get('Handler', ''))} | {safe_str(row.get('Dog', ''))} | {safe_str(row.get('Status', 'ACTIVE'))}"
 
 
+def build_ro_options(df: pd.DataFrame):
+    if df is None or df.empty:
+        return []
+    options = []
+    for idx, row in df.iterrows():
+        if safe_str(row.get("Status", "ACTIVE")).upper() == "SCRATCH":
+            continue
+        ro = safe_str(row.get("RO", "")) or "--"
+        handler = safe_str(row.get("Handler", ""))
+        dog = safe_str(row.get("Dog", ""))
+        label = f"RO {ro}"
+        if handler:
+            label += f" - {handler}"
+        if dog:
+            label += f" / {dog}"
+        options.append((label, idx))
+    return options
+
+
+def jump_to_ro(df: pd.DataFrame, selected_idx: int) -> int:
+    if df is None or df.empty:
+        return 0
+    selected_idx = max(0, min(int(selected_idx), len(df) - 1))
+    if is_active_row(df.iloc[selected_idx]):
+        return selected_idx
+    return get_next_active_index(df, selected_idx)
+
+
 def add_team(df: pd.DataFrame, ro_value: str, handler: str, dog: str, breed: str) -> pd.DataFrame:
     df = df.copy()
     ro_value = safe_str(ro_value)
@@ -436,6 +464,13 @@ if mode == "Public Display":
     if st.session_state.left_flash or st.session_state.right_flash:
         time.sleep(0.35)
 
+    public_df = st.session_state.master_df.copy()
+    public_df = public_df[public_df["Status"].fillna("ACTIVE").astype(str).str.upper() != "SCRATCH"].copy()
+    public_df = public_df[[c for c in ["RO", "Handler", "Dog", "Breed"] if c in public_df.columns]]
+
+    with st.expander("Show full running order"):
+        st.dataframe(public_df, use_container_width=True, hide_index=True, height=420)
+
     st.session_state.left_flash = False
     st.session_state.right_flash = False
     st.stop()
@@ -472,6 +507,27 @@ with admin_left:
         index=0 if st.session_state.left_status_text == "HOLD" else 1,
         key="left_hold_text_select",
     )
+
+    left_ro_options = build_ro_options(master_df)
+    left_ro_labels = [label for label, _ in left_ro_options]
+    left_ro_indices = {label: idx for label, idx in left_ro_options}
+    current_left_label = None
+    for label, idx in left_ro_options:
+        if idx == st.session_state.left_index:
+            current_left_label = label
+            break
+    if left_ro_labels:
+        selected_left_ro = st.selectbox(
+            "Search 1 Start / Current RO",
+            options=left_ro_labels,
+            index=left_ro_labels.index(current_left_label) if current_left_label in left_ro_labels else 0,
+            key="left_ro_jump_select",
+            help="Select the running order number Search 1 should display.",
+        )
+        if st.button("Set Search 1 RO", key="set_left_ro", use_container_width=True):
+            st.session_state.left_index = jump_to_ro(master_df, left_ro_indices[selected_left_ro])
+            st.session_state.left_flash = True
+            st.rerun()
 
     lnav1, lnav2, lnav3 = st.columns(3)
     with lnav1:
@@ -587,6 +643,27 @@ with admin_right:
         index=0 if st.session_state.right_status_text == "HOLD" else 1,
         key="right_hold_text_select",
     )
+
+    right_ro_options = build_ro_options(master_df)
+    right_ro_labels = [label for label, _ in right_ro_options]
+    right_ro_indices = {label: idx for label, idx in right_ro_options}
+    current_right_label = None
+    for label, idx in right_ro_options:
+        if idx == st.session_state.right_index:
+            current_right_label = label
+            break
+    if right_ro_labels:
+        selected_right_ro = st.selectbox(
+            "Search 2 Start / Current RO",
+            options=right_ro_labels,
+            index=right_ro_labels.index(current_right_label) if current_right_label in right_ro_labels else 0,
+            key="right_ro_jump_select",
+            help="Select the running order number Search 2 should display.",
+        )
+        if st.button("Set Search 2 RO", key="set_right_ro", use_container_width=True):
+            st.session_state.right_index = jump_to_ro(master_df, right_ro_indices[selected_right_ro])
+            st.session_state.right_flash = True
+            st.rerun()
 
     rnav1, rnav2, rnav3 = st.columns(3)
     with rnav1:
