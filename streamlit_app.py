@@ -349,7 +349,7 @@ st.caption("Manual, editable, live event board for day-of-trial changes.")
 mode = st.sidebar.radio(
     "View",
     ["Public Display", "Admin"],
-    index=0,
+    index=1,
     help="Use Public Display on the phone-facing screen. Use Admin on the control device.",
 )
 
